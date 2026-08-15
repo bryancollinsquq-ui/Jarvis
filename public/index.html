@@ -100,6 +100,7 @@
     font-family:'JetBrains Mono',monospace; font-size:9px; padding:2px 7px; border-radius:5px;
     letter-spacing:.05em; text-transform:uppercase;
   }
+  .model-badge.gemini{background:rgba(93,216,138,0.15); color:var(--green);}
   .model-badge.claude{background:rgba(91,140,255,0.15); color:var(--blue);}
   .model-badge.gpt{background:rgba(255,180,84,0.15); color:var(--amber);}
 
@@ -234,7 +235,7 @@
         <div class="status" id="statusText">TAP TO SPEAK</div>
         <div class="transcript" id="transcript"></div>
       </div>
-      <div class="hint">Runs on your machine · Claude primary, GPT-4o fallback</div>
+      <div class="hint">Runs on your machine · Gemini (free), Claude/GPT optional fallback</div>
     </div>
 
     <!-- Metrics -->
@@ -251,8 +252,12 @@
       <div class="metric-card" style="margin-bottom:4px;">
         <div class="panel-title" style="margin-bottom:8px;">Model Usage</div>
         <div class="model-row">
+          <span><span class="model-badge gemini">Gemini</span></span>
+          <span id="metricGemini">0 calls</span>
+        </div>
+        <div class="model-row">
           <span><span class="model-badge claude">Claude</span></span>
-          <span id="metricClaude">0 calls</span>
+          <span id="metricClaude">0 fallbacks</span>
         </div>
         <div class="model-row">
           <span><span class="model-badge gpt">GPT-4o</span></span>
@@ -406,7 +411,8 @@
       const res = await fetch('/api/metrics');
       const data = await res.json();
       document.getElementById('metricMessages').textContent = data.metrics.messagesToday;
-      document.getElementById('metricClaude').textContent = data.metrics.claudeCalls + ' calls';
+      document.getElementById('metricGemini').textContent = data.metrics.geminiCalls + ' calls';
+      document.getElementById('metricClaude').textContent = data.metrics.claudeFallbacks + ' fallbacks';
       document.getElementById('metricGpt').textContent = data.metrics.gptFallbacks + ' fallbacks';
       const startedMs = new Date(data.metrics.startedAt).getTime();
       const upMin = Math.floor((Date.now() - startedMs) / 60000);
