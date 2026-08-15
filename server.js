@@ -1,27 +1,22 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error('\n❌ Missing ANTHROPIC_API_KEY.');
-  console.error('   Copy .env.example to .env and paste your real key in.\n');
+const hasGemini = !!process.env.GEMINI_API_KEY;
+const hasClaude = !!process.env.ANTHROPIC_API_KEY;
+const hasOpenAI = !!process.env.OPENAI_API_KEY;
+
+if (!hasGemini) {
+  console.error('\n❌ Missing GEMINI_API_KEY.');
+  console.error('   Copy .env.example to .env and paste your free Gemini key in.');
+  console.error('   Get one at https://aistudio.google.com/apikey\n');
   process.exit(1);
 }
-
-const hasOpenAI = !!process.env.OPENAI_API_KEY;
-if (!hasOpenAI) {
-  console.warn('⚠️  No OPENAI_API_KEY found — running Claude-only, no fallback model.');
-}
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const openai = hasOpenAI ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
 // This is where your assistant's personality lives. Edit freely.
 const SYSTEM_PROMPT = `You are Jarvis, a sharp, efficient personal AI assistant.
@@ -32,11 +27,12 @@ Be a little witty, but always genuinely helpful. Never pad your answers with fil
 let conversationHistory = [];
 const MAX_TURNS = 20;
 
-// In-memory activity log + metrics for the dashboard (mock/local — not persisted)
+// In-memory activity log + metrics for the dashboard (not persisted)
 let activityLog = [];
 let metrics = {
   messagesToday: 0,
-  claudeCalls: 0,
+  geminiCalls: 0,
+  claudeFallbacks: 0,
   gptFallbacks: 0,
   errors: 0,
   startedAt: new Date().toISOString(),
@@ -47,20 +43,54 @@ function logActivity(entry) {
   if (activityLog.length > 50) activityLog = activityLog.slice(0, 50);
 }
 
+// ---------- Gemini (free, primary) ----------
+async function askGemini(history) {
+  const contents = history.map((m) => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }));
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': process.env.GEMINI_API_KEY,
+    },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents,
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini ${res.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text).join('\n');
+  if (!text) throw new Error('Gemini returned an empty response.');
+  return text;
+}
+
+// ---------- Claude (optional paid fallback) ----------
 async function askClaude(history) {
+  const Anthropic = (await import('@anthropic-ai/sdk')).default;
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 300,
     system: SYSTEM_PROMPT,
     messages: history,
   });
-  return response.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n');
+  return response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
 }
 
+// ---------- GPT (optional paid fallback) ----------
 async function askGPT(history) {
+  const OpenAI = (await import('openai')).default;
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const response = await openai.chat.completions.create({
     model: 'gpt-4o',
     max_tokens: 300,
@@ -71,9 +101,7 @@ async function askGPT(history) {
 
 app.post('/api/chat', async (req, res) => {
   const userMessage = (req.body.message || '').trim();
-  if (!userMessage) {
-    return res.status(400).json({ error: 'No message provided.' });
-  }
+  if (!userMessage) return res.status(400).json({ error: 'No message provided.' });
 
   conversationHistory.push({ role: 'user', content: userMessage });
   if (conversationHistory.length > MAX_TURNS * 2) {
@@ -84,34 +112,47 @@ app.post('/api/chat', async (req, res) => {
   let reply = null;
   let usedModel = null;
 
-  // Try Claude first
+  // 1. Try Gemini (free)
   try {
-    reply = await askClaude(conversationHistory);
-    usedModel = 'claude';
-    metrics.claudeCalls += 1;
+    reply = await askGemini(conversationHistory);
+    usedModel = 'gemini';
+    metrics.geminiCalls += 1;
   } catch (err) {
-    console.error('Claude failed:', err.message);
-    logActivity({ type: 'error', text: `Claude call failed: ${err.message}` });
+    const detail = err.cause ? `${err.message} (cause: ${err.cause.message || err.cause})` : err.message;
+    console.error('Gemini failed:', detail);
+    logActivity({ type: 'error', text: `Gemini call failed: ${detail}` });
 
-    // Fall back to GPT if available
-    if (hasOpenAI) {
+    // 2. Fall back to Claude if configured
+    if (hasClaude) {
+      try {
+        reply = await askClaude(conversationHistory);
+        usedModel = 'claude';
+        metrics.claudeFallbacks += 1;
+        logActivity({ type: 'fallback', text: 'Fell back to Claude successfully.' });
+      } catch (err2) {
+        console.error('Claude fallback failed:', err2.message);
+        logActivity({ type: 'error', text: `Claude fallback failed: ${err2.message}` });
+      }
+    }
+
+    // 3. Fall back to GPT if still no reply and configured
+    if (!reply && hasOpenAI) {
       try {
         reply = await askGPT(conversationHistory);
         usedModel = 'gpt';
         metrics.gptFallbacks += 1;
         logActivity({ type: 'fallback', text: 'Fell back to GPT-4o successfully.' });
-      } catch (err2) {
-        console.error('GPT fallback also failed:', err2.message);
-        metrics.errors += 1;
-        logActivity({ type: 'error', text: `GPT fallback also failed: ${err2.message}` });
+      } catch (err3) {
+        console.error('GPT fallback failed:', err3.message);
+        logActivity({ type: 'error', text: `GPT fallback failed: ${err3.message}` });
       }
-    } else {
-      metrics.errors += 1;
     }
+
+    if (!reply) metrics.errors += 1;
   }
 
   if (!reply) {
-    return res.status(500).json({ error: 'Both Claude and GPT failed to respond. Check your terminal for details.' });
+    return res.status(500).json({ error: 'Gemini failed and no working fallback is configured. Check your terminal for details.' });
   }
 
   conversationHistory.push({ role: 'assistant', content: reply });
@@ -131,11 +172,12 @@ app.get('/api/activity', (req, res) => {
 });
 
 app.get('/api/metrics', (req, res) => {
-  res.json({ metrics, hasOpenAI });
+  res.json({ metrics, hasGemini, hasClaude, hasOpenAI });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n🟢 Jarvis is running: http://localhost:${PORT}`);
-  console.log(hasOpenAI ? '   Models: Claude (primary) + GPT-4o (fallback)\n' : '   Models: Claude only\n');
+  const extras = [hasClaude && 'Claude', hasOpenAI && 'GPT-4o'].filter(Boolean);
+  console.log(`   Brain: Gemini (free)${extras.length ? ' + fallback: ' + extras.join(', ') : ''}\n`);
 });
